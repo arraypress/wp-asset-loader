@@ -40,10 +40,36 @@ class AssetLoader {
 	 */
 	public static function register( string $namespace, ?string $assets_path = null ): void {
 		if ( $assets_path === null ) {
-			// Auto-detect caller's directory and append /assets
+			// Auto-detect caller's directory
 			$backtrace   = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 1 );
-			$caller_dir  = dirname( $backtrace[0]['file'] );
-			$assets_path = $caller_dir . '/assets';
+			$caller_file = $backtrace[0]['file'];
+			$caller_dir  = dirname( $caller_file );
+
+			// Check if we're in a /src directory (common for composer packages)
+			if ( basename( $caller_dir ) === 'src' ) {
+				// Go up one level to the package root, then look for assets
+				$package_root = dirname( $caller_dir );
+				$assets_path  = $package_root . '/assets';
+			} else {
+				// Default behavior: assets folder relative to caller
+				$assets_path = $caller_dir . '/assets';
+			}
+
+			// Fallback: if assets don't exist, try some common patterns
+			if ( ! is_dir( $assets_path ) ) {
+				$alternatives = [
+					$caller_dir . '/assets',
+					dirname( $caller_dir ) . '/assets',
+					$caller_dir . '/../assets',
+				];
+
+				foreach ( $alternatives as $alt_path ) {
+					if ( is_dir( $alt_path ) ) {
+						$assets_path = $alt_path;
+						break;
+					}
+				}
+			}
 		}
 
 		self::$resolvers[ $namespace ] = rtrim( $assets_path, '/' );
