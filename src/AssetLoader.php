@@ -40,35 +40,73 @@ class AssetLoader {
 	 */
 	public static function register( string $namespace, ?string $assets_path = null ): void {
 		if ( $assets_path === null ) {
-			// Auto-detect caller's directory
-			$backtrace   = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 1 );
-			$caller_file = $backtrace[0]['file'];
-			$caller_dir  = dirname( $caller_file );
+			// Get the actual calling namespace to find the right file
+			$caller_namespace = self::get_caller_namespace();
 
-			// Check if we're in a /src directory (common for composer packages)
-			if ( basename( $caller_dir ) === 'src' ) {
-				// Go up one level to the package root, then look for assets
-				$package_root = dirname( $caller_dir );
-				$assets_path  = $package_root . '/assets';
-			} else {
-				// Default behavior: assets folder relative to caller
-				$assets_path = $caller_dir . '/assets';
-			}
+			// Find the file that contains this namespace
+			$backtrace   = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 6 );
+			$caller_file = null;
 
-			// Fallback: if assets don't exist, try some common patterns
-			if ( ! is_dir( $assets_path ) ) {
-				$alternatives = [
-					$caller_dir . '/assets',
-					dirname( $caller_dir ) . '/assets',
-					$caller_dir . '/../assets',
-				];
+			foreach ( $backtrace as $trace ) {
+				// Skip this class and utility files
+				if ( isset( $trace['class'] ) && $trace['class'] === __CLASS__ ) {
+					continue;
+				}
+				if ( isset( $trace['file'] ) && strpos( $trace['file'], 'Utilities.php' ) !== false ) {
+					continue;
+				}
 
-				foreach ( $alternatives as $alt_path ) {
-					if ( is_dir( $alt_path ) ) {
-						$assets_path = $alt_path;
+				// Check if this file has the right namespace
+				if ( isset( $trace['file'] ) && file_exists( $trace['file'] ) ) {
+					$file_namespace = self::extract_namespace_from_file( $trace['file'] );
+					if ( $file_namespace === $caller_namespace ) {
+						$caller_file = $trace['file'];
 						break;
 					}
 				}
+			}
+
+			if ( ! $caller_file ) {
+				// Fallback to first non-utility file
+				foreach ( $backtrace as $trace ) {
+					if ( isset( $trace['file'] ) && strpos( $trace['file'], 'Utilities.php' ) === false ) {
+						$caller_file = $trace['file'];
+						break;
+					}
+				}
+			}
+
+			if ( $caller_file ) {
+				$caller_dir = dirname( $caller_file );
+
+				// Check if we're in a /src directory (common for composer packages)
+				if ( basename( $caller_dir ) === 'src' ) {
+					// Go up one level to the package root, then look for assets
+					$package_root = dirname( $caller_dir );
+					$assets_path  = $package_root . '/assets';
+				} else {
+					// Default behavior: assets folder relative to caller
+					$assets_path = $caller_dir . '/assets';
+				}
+
+				// Fallback: if assets doesn't exist, try some common patterns
+				if ( ! is_dir( $assets_path ) ) {
+					$alternatives = [
+						$caller_dir . '/assets',
+						dirname( $caller_dir ) . '/assets',
+						$caller_dir . '/../assets',
+					];
+
+					foreach ( $alternatives as $alt_path ) {
+						if ( is_dir( $alt_path ) ) {
+							$assets_path = $alt_path;
+							break;
+						}
+					}
+				}
+			} else {
+				// Fallback if we can't determine caller
+				$assets_path = dirname( __DIR__ ) . '/assets';
 			}
 		}
 
