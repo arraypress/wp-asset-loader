@@ -5,7 +5,7 @@
  * @package     ArrayPress\WP\AssetLoader
  * @copyright   Copyright (c) 2025, ArrayPress Limited
  * @license     GPL2+
- * @version     1.0.0
+ * @version     1.0.1
  * @author      David Sherlock
  */
 
@@ -29,6 +29,13 @@ class AssetLoader {
 	 * @var array
 	 */
 	private static array $resolvers = [];
+
+	/**
+	 * Tracks which assets have been enqueued to prevent duplicates
+	 *
+	 * @var array
+	 */
+	private static array $enqueued_assets = [];
 
 	/**
 	 * Register an asset path for a namespace
@@ -144,16 +151,32 @@ class AssetLoader {
 			return false;
 		}
 
+		// Generate handle if not provided
+		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.css' ) );
+
+		// Check if this style has already been enqueued
+		if (wp_style_is($handle, 'enqueued')) {
+			return $handle;
+		}
+
+		// Check our internal tracking as well
+		$asset_key = $namespace . '|style|' . $file;
+		if (isset(self::$enqueued_assets[$asset_key])) {
+			return self::$enqueued_assets[$asset_key];
+		}
+
 		$url = self::path_to_url( $file_path );
 
 		if ( ! $url ) {
 			return false;
 		}
 
-		$handle  = $handle ?: self::generate_handle( $namespace, basename( $file, '.css' ) );
 		$version = $version ?: (string) filemtime( $file_path );
 
 		wp_enqueue_style( $handle, $url, $deps, $version, $media );
+
+		// Track this asset to prevent duplicate enqueueing
+		self::$enqueued_assets[$asset_key] = $handle;
 
 		return $handle;
 	}
@@ -189,16 +212,32 @@ class AssetLoader {
 			return false;
 		}
 
+		// Generate handle if not provided
+		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.js' ) );
+
+		// Check if this script has already been enqueued
+		if (wp_script_is($handle, 'enqueued')) {
+			return $handle;
+		}
+
+		// Check our internal tracking as well
+		$asset_key = $namespace . '|script|' . $file;
+		if (isset(self::$enqueued_assets[$asset_key])) {
+			return self::$enqueued_assets[$asset_key];
+		}
+
 		$url = self::path_to_url( $file_path );
 
 		if ( ! $url ) {
 			return false;
 		}
 
-		$handle  = $handle ?: self::generate_handle( $namespace, basename( $file, '.js' ) );
 		$version = $version ?: (string) filemtime( $file_path );
 
 		wp_enqueue_script( $handle, $url, $deps, $version, $in_footer );
+
+		// Track this asset to prevent duplicate enqueueing
+		self::$enqueued_assets[$asset_key] = $handle;
 
 		return $handle;
 	}
@@ -263,6 +302,13 @@ class AssetLoader {
 	 * @return bool Whether the localization was successful
 	 */
 	public static function localize_script( string $handle, string $object_name, array $data ): bool {
+		// Check if script is already localized with this object name
+		if (wp_script_is($handle, 'localized') &&
+		    isset($GLOBALS['wp_scripts']->registered[$handle]->extra['data']) &&
+		    strpos($GLOBALS['wp_scripts']->registered[$handle]->extra['data'], "var $object_name") !== false) {
+			return true;
+		}
+
 		return wp_localize_script( $handle, $object_name, $data );
 	}
 
@@ -285,8 +331,16 @@ class AssetLoader {
 	public static function clear( string $namespace = '' ): void {
 		if ( empty( $namespace ) ) {
 			self::$resolvers = [];
+			self::$enqueued_assets = [];
 		} else {
 			unset( self::$resolvers[ $namespace ] );
+
+			// Also clear any enqueued assets for this namespace
+			foreach (self::$enqueued_assets as $key => $handle) {
+				if (strpos($key, $namespace . '|') === 0) {
+					unset(self::$enqueued_assets[$key]);
+				}
+			}
 		}
 	}
 
