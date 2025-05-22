@@ -1,12 +1,12 @@
 <?php
 /**
- * WordPress Asset Loader
+ * Improved WordPress Asset Loader
  *
  * @package     ArrayPress\WP\AssetLoader
  * @copyright   Copyright (c) 2025, ArrayPress Limited
  * @license     GPL2+
- * @version     1.0.1
- * @author      David Sherlock
+ * @version     2.0.0
+ * @author      ArrayPress Team
  */
 
 declare( strict_types=1 );
@@ -18,17 +18,17 @@ defined( 'ABSPATH' ) || exit;
 /**
  * Class AssetLoader
  *
- * Simple utility for loading WordPress assets from Composer libraries.
- * Supports namespace-based asset registration and automatic path resolution.
+ * Enhanced utility for loading WordPress assets from Composer libraries.
+ * Supports namespace-based asset registration with improved path detection.
  */
 class AssetLoader {
 
 	/**
-	 * Registered asset paths by namespace
+	 * Registered asset configurations by namespace
 	 *
 	 * @var array
 	 */
-	private static array $resolvers = [];
+	private static array $registrations = [];
 
 	/**
 	 * Tracks which assets have been enqueued to prevent duplicates
@@ -38,157 +38,65 @@ class AssetLoader {
 	private static array $enqueued_assets = [];
 
 	/**
-	 * Register an asset path for a namespace
+	 * Cache for namespace detection to improve performance
 	 *
-	 * @param string      $namespace   The namespace for the library
-	 * @param string|null $assets_path Optional. Path to the assets folder. Defaults to /assets relative to caller.
-	 *
-	 * @return void
+	 * @var array
 	 */
-	public static function register( string $namespace, ?string $assets_path = null ): void {
+	private static array $namespace_cache = [];
+
+	/**
+	 * Register an asset configuration for a namespace
+	 *
+	 * @param string      $namespace    The namespace for the library
+	 * @param string|null $assets_path  Optional. Path to the assets folder
+	 * @param string|null $assets_url   Optional. URL to the assets folder (for CDN support)
+	 * @param array       $config       Optional. Additional configuration
+	 *
+	 * @return bool True on success, false on failure
+	 */
+	public static function register(
+		string $namespace,
+		?string $assets_path = null,
+		?string $assets_url = null,
+		array $config = []
+	): bool {
+		// Auto-detect path if not provided
 		if ( $assets_path === null ) {
-			// Get the actual calling namespace to find the right file
-			$caller_namespace = self::get_caller_namespace();
-
-			// Find the file that contains this namespace
-			$backtrace   = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 6 );
-			$caller_file = null;
-
-			foreach ( $backtrace as $trace ) {
-				// Skip this class and utility files
-				if ( isset( $trace['class'] ) && $trace['class'] === __CLASS__ ) {
-					continue;
-				}
-				if ( isset( $trace['file'] ) && strpos( $trace['file'], 'Utilities.php' ) !== false ) {
-					continue;
-				}
-
-				// Check if this file has the right namespace
-				if ( isset( $trace['file'] ) && file_exists( $trace['file'] ) ) {
-					$file_namespace = self::extract_namespace_from_file( $trace['file'] );
-					if ( $file_namespace === $caller_namespace ) {
-						$caller_file = $trace['file'];
-						break;
-					}
-				}
-			}
-
-			if ( ! $caller_file ) {
-				// Fallback to first non-utility file
-				foreach ( $backtrace as $trace ) {
-					if ( isset( $trace['file'] ) && strpos( $trace['file'], 'Utilities.php' ) === false ) {
-						$caller_file = $trace['file'];
-						break;
-					}
-				}
-			}
-
-			if ( $caller_file ) {
-				$caller_dir = dirname( $caller_file );
-
-				// Check if we're in a /src directory (common for composer packages)
-				if ( basename( $caller_dir ) === 'src' ) {
-					// Go up one level to the package root, then look for assets
-					$package_root = dirname( $caller_dir );
-					$assets_path  = $package_root . '/assets';
-				} else {
-					// Default behavior: assets folder relative to caller
-					$assets_path = $caller_dir . '/assets';
-				}
-
-				// Fallback: if assets doesn't exist, try some common patterns
-				if ( ! is_dir( $assets_path ) ) {
-					$alternatives = [
-						$caller_dir . '/assets',
-						dirname( $caller_dir ) . '/assets',
-						$caller_dir . '/../assets',
-					];
-
-					foreach ( $alternatives as $alt_path ) {
-						if ( is_dir( $alt_path ) ) {
-							$assets_path = $alt_path;
-							break;
-						}
-					}
-				}
-			} else {
-				// Fallback if we can't determine caller
-				$assets_path = dirname( __DIR__ ) . '/assets';
-			}
+			$assets_path = self::detect_assets_path( $namespace );
 		}
 
-		self::$resolvers[ $namespace ] = rtrim( $assets_path, '/' );
+		if ( ! $assets_path ) {
+			return false;
+		}
+
+		// Auto-detect URL if not provided
+		if ( $assets_url === null ) {
+			$assets_url = self::path_to_url( $assets_path );
+		}
+
+		// Store the configuration
+		self::$registrations[ $namespace ] = [
+			'assets_path' => rtrim( $assets_path, '/' ),
+			'assets_url'  => rtrim( $assets_url, '/' ),
+			'config'      => array_merge( [
+				'version_strategy' => 'filemtime', // or 'static'
+				'cache_busting'    => true,
+				'handle_prefix'    => '',
+			], $config )
+		];
+
+		return true;
 	}
 
 	/**
-	 * Enqueue a CSS file from the calling library
+	 * Enhanced script enqueuing with better error handling
 	 *
-	 * @param string      $file    Relative path to the CSS file (from assets folder)
-	 * @param array       $deps    Optional. Array of style handles to enqueue before this one. Default empty array.
-	 * @param string|null $version Optional. Version string for cache busting. Default null.
-	 * @param string      $media   Optional. Media for which this stylesheet applies. Default 'all'.
-	 * @param string      $handle  Optional. Custom handle for the style. If empty, auto-generated. Default empty.
-	 *
-	 * @return string|false Style handle on success, false on failure
-	 */
-	public static function enqueue_style(
-		string $file,
-		array $deps = [],
-		?string $version = null,
-		string $media = 'all',
-		string $handle = ''
-	) {
-		$namespace = self::get_caller_namespace();
-
-		if ( ! $namespace || ! isset( self::$resolvers[ $namespace ] ) ) {
-			return false;
-		}
-
-		$assets_path = self::$resolvers[ $namespace ];
-		$file_path   = $assets_path . '/' . ltrim( $file, '/' );
-
-		if ( ! file_exists( $file_path ) ) {
-			return false;
-		}
-
-		// Generate handle if not provided
-		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.css' ) );
-
-		// Check if this style has already been enqueued
-		if (wp_style_is($handle, 'enqueued')) {
-			return $handle;
-		}
-
-		// Check our internal tracking as well
-		$asset_key = $namespace . '|style|' . $file;
-		if (isset(self::$enqueued_assets[$asset_key])) {
-			return self::$enqueued_assets[$asset_key];
-		}
-
-		$url = self::path_to_url( $file_path );
-
-		if ( ! $url ) {
-			return false;
-		}
-
-		$version = $version ?: (string) filemtime( $file_path );
-
-		wp_enqueue_style( $handle, $url, $deps, $version, $media );
-
-		// Track this asset to prevent duplicate enqueueing
-		self::$enqueued_assets[$asset_key] = $handle;
-
-		return $handle;
-	}
-
-	/**
-	 * Enqueue a JavaScript file from the calling library
-	 *
-	 * @param string      $file      Relative path to the JS file (from assets folder)
-	 * @param array       $deps      Optional. Array of script handles to enqueue before this one. Default ['jquery'].
-	 * @param string|null $version   Optional. Version string for cache busting. Default null.
-	 * @param bool        $in_footer Optional. Whether to enqueue the script in the footer. Default true.
-	 * @param string      $handle    Optional. Custom handle for the script. If empty, auto-generated. Default empty.
+	 * @param string      $file      Relative path to the JS file
+	 * @param array       $deps      Dependencies
+	 * @param string|null $version   Version string
+	 * @param bool        $in_footer Whether to load in footer
+	 * @param string      $handle    Custom handle
+	 * @param string|null $namespace Specific namespace to use
 	 *
 	 * @return string|false Script handle on success, false on failure
 	 */
@@ -197,160 +105,164 @@ class AssetLoader {
 		array $deps = [ 'jquery' ],
 		?string $version = null,
 		bool $in_footer = true,
-		string $handle = ''
+		string $handle = '',
+		?string $namespace = null
 	) {
-		$namespace = self::get_caller_namespace();
+		$namespace = $namespace ?: self::get_calling_namespace();
 
-		if ( ! $namespace || ! isset( self::$resolvers[ $namespace ] ) ) {
+		if ( ! $namespace || ! isset( self::$registrations[ $namespace ] ) ) {
+			error_log( "AssetLoader: Namespace '{$namespace}' not registered for file '{$file}'" );
 			return false;
 		}
 
-		$assets_path = self::$resolvers[ $namespace ];
-		$file_path   = $assets_path . '/' . ltrim( $file, '/' );
+		$config = self::$registrations[ $namespace ];
+		$file_path = $config['assets_path'] . '/' . ltrim( $file, '/' );
 
 		if ( ! file_exists( $file_path ) ) {
+			error_log( "AssetLoader: Script file not found: {$file_path}" );
 			return false;
 		}
 
-		// Generate handle if not provided
-		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.js' ) );
+		// Generate handle
+		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.js' ), $config );
 
-		// Check if this script has already been enqueued
-		if (wp_script_is($handle, 'enqueued')) {
+		// Check if already enqueued
+		if ( wp_script_is( $handle, 'enqueued' ) ) {
 			return $handle;
 		}
 
-		// Check our internal tracking as well
+		// Check internal tracking
 		$asset_key = $namespace . '|script|' . $file;
-		if (isset(self::$enqueued_assets[$asset_key])) {
-			return self::$enqueued_assets[$asset_key];
+		if ( isset( self::$enqueued_assets[ $asset_key ] ) ) {
+			return self::$enqueued_assets[ $asset_key ];
 		}
 
-		$url = self::path_to_url( $file_path );
+		// Build URL
+		$url = $config['assets_url'] . '/' . ltrim( $file, '/' );
 
-		if ( ! $url ) {
-			return false;
-		}
+		// Handle versioning
+		$version = self::resolve_version( $version, $file_path, $config );
 
-		$version = $version ?: (string) filemtime( $file_path );
-
+		// Enqueue the script
 		wp_enqueue_script( $handle, $url, $deps, $version, $in_footer );
 
-		// Track this asset to prevent duplicate enqueueing
-		self::$enqueued_assets[$asset_key] = $handle;
+		// Track the asset
+		self::$enqueued_assets[ $asset_key ] = $handle;
 
 		return $handle;
 	}
 
 	/**
-	 * Get the URL for an asset file
+	 * Enhanced style enqueuing
 	 *
-	 * @param string      $file      Relative path to the asset file
-	 * @param string|null $namespace Optional. Specific namespace to use. If null, uses caller's namespace.
+	 * @param string      $file      Relative path to the CSS file
+	 * @param array       $deps      Dependencies
+	 * @param string|null $version   Version string
+	 * @param string      $media     Media type
+	 * @param string      $handle    Custom handle
+	 * @param string|null $namespace Specific namespace to use
+	 *
+	 * @return string|false Style handle on success, false on failure
+	 */
+	public static function enqueue_style(
+		string $file,
+		array $deps = [],
+		?string $version = null,
+		string $media = 'all',
+		string $handle = '',
+		?string $namespace = null
+	) {
+		$namespace = $namespace ?: self::get_calling_namespace();
+
+		if ( ! $namespace || ! isset( self::$registrations[ $namespace ] ) ) {
+			error_log( "AssetLoader: Namespace '{$namespace}' not registered for file '{$file}'" );
+			return false;
+		}
+
+		$config = self::$registrations[ $namespace ];
+		$file_path = $config['assets_path'] . '/' . ltrim( $file, '/' );
+
+		if ( ! file_exists( $file_path ) ) {
+			error_log( "AssetLoader: Style file not found: {$file_path}" );
+			return false;
+		}
+
+		// Generate handle
+		$handle = $handle ?: self::generate_handle( $namespace, basename( $file, '.css' ), $config );
+
+		// Check if already enqueued
+		if ( wp_style_is( $handle, 'enqueued' ) ) {
+			return $handle;
+		}
+
+		// Check internal tracking
+		$asset_key = $namespace . '|style|' . $file;
+		if ( isset( self::$enqueued_assets[ $asset_key ] ) ) {
+			return self::$enqueued_assets[ $asset_key ];
+		}
+
+		// Build URL
+		$url = $config['assets_url'] . '/' . ltrim( $file, '/' );
+
+		// Handle versioning
+		$version = self::resolve_version( $version, $file_path, $config );
+
+		// Enqueue the style
+		wp_enqueue_style( $handle, $url, $deps, $version, $media );
+
+		// Track the asset
+		self::$enqueued_assets[ $asset_key ] = $handle;
+
+		return $handle;
+	}
+
+	/**
+	 * Get asset URL with namespace support
+	 *
+	 * @param string      $file      Relative path to the asset
+	 * @param string|null $namespace Specific namespace to use
 	 *
 	 * @return string|null Asset URL or null if not found
 	 */
 	public static function get_asset_url( string $file, ?string $namespace = null ): ?string {
-		$namespace = $namespace ?: self::get_caller_namespace();
+		$namespace = $namespace ?: self::get_calling_namespace();
 
-		if ( ! $namespace || ! isset( self::$resolvers[ $namespace ] ) ) {
+		if ( ! $namespace || ! isset( self::$registrations[ $namespace ] ) ) {
 			return null;
 		}
 
-		$assets_path = self::$resolvers[ $namespace ];
-		$file_path   = $assets_path . '/' . ltrim( $file, '/' );
+		$config = self::$registrations[ $namespace ];
+		$file_path = $config['assets_path'] . '/' . ltrim( $file, '/' );
 
 		if ( ! file_exists( $file_path ) ) {
 			return null;
 		}
 
-		return self::path_to_url( $file_path );
+		return $config['assets_url'] . '/' . ltrim( $file, '/' );
 	}
 
 	/**
-	 * Get the file path for an asset file
+	 * Improved namespace detection with caching
 	 *
-	 * @param string      $file      Relative path to the asset file
-	 * @param string|null $namespace Optional. Specific namespace to use. If null, uses caller's namespace.
-	 *
-	 * @return string|null Asset file path or null if not found
+	 * @return string|null
 	 */
-	public static function get_asset_path( string $file, ?string $namespace = null ): ?string {
-		$namespace = $namespace ?: self::get_caller_namespace();
+	private static function get_calling_namespace(): ?string {
+		$backtrace = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 8 );
+		$cache_key = '';
 
-		if ( ! $namespace || ! isset( self::$resolvers[ $namespace ] ) ) {
-			return null;
-		}
-
-		$assets_path = self::$resolvers[ $namespace ];
-		$file_path   = $assets_path . '/' . ltrim( $file, '/' );
-
-		if ( ! file_exists( $file_path ) ) {
-			return null;
-		}
-
-		return $file_path;
-	}
-
-	/**
-	 * Localize data for a script
-	 *
-	 * @param string $handle      Script handle
-	 * @param string $object_name JavaScript object name
-	 * @param array  $data        Localization data
-	 *
-	 * @return bool Whether the localization was successful
-	 */
-	public static function localize_script( string $handle, string $object_name, array $data ): bool {
-		// Check if script is already localized with this object name
-		if (wp_script_is($handle, 'localized') &&
-		    isset($GLOBALS['wp_scripts']->registered[$handle]->extra['data']) &&
-		    strpos($GLOBALS['wp_scripts']->registered[$handle]->extra['data'], "var $object_name") !== false) {
-			return true;
-		}
-
-		return wp_localize_script( $handle, $object_name, $data );
-	}
-
-	/**
-	 * Get all registered namespaces and their paths
-	 *
-	 * @return array Array of registered namespaces and paths
-	 */
-	public static function get_registered(): array {
-		return self::$resolvers;
-	}
-
-	/**
-	 * Clear registration for a specific namespace or all namespaces
-	 *
-	 * @param string $namespace Optional. Specific namespace to clear. If empty, clears all registrations.
-	 *
-	 * @return void
-	 */
-	public static function clear( string $namespace = '' ): void {
-		if ( empty( $namespace ) ) {
-			self::$resolvers = [];
-			self::$enqueued_assets = [];
-		} else {
-			unset( self::$resolvers[ $namespace ] );
-
-			// Also clear any enqueued assets for this namespace
-			foreach (self::$enqueued_assets as $key => $handle) {
-				if (strpos($key, $namespace . '|') === 0) {
-					unset(self::$enqueued_assets[$key]);
-				}
+		// Build cache key from backtrace
+		foreach ( $backtrace as $trace ) {
+			if ( isset( $trace['file'] ) ) {
+				$cache_key .= $trace['file'] . '|';
 			}
 		}
-	}
 
-	/**
-	 * Get the namespace of the calling function
-	 *
-	 * @return string|null Namespace or null if not found
-	 */
-	private static function get_caller_namespace(): ?string {
-		$backtrace = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 4 );
+		// Check cache first
+		if ( isset( self::$namespace_cache[ $cache_key ] ) ) {
+			return self::$namespace_cache[ $cache_key ];
+		}
+
+		$namespace = null;
 
 		foreach ( $backtrace as $trace ) {
 			// Skip this class
@@ -366,16 +278,69 @@ class AssetLoader {
 			// Get namespace from class if available
 			if ( isset( $trace['class'] ) ) {
 				$class_parts = explode( '\\', $trace['class'] );
-				array_pop( $class_parts ); // Remove class name
 
-				return implode( '\\', $class_parts );
+				// Try different levels - sometimes we want the parent namespace
+				for ( $i = count( $class_parts ) - 1; $i >= 1; $i-- ) {
+					$potential_namespace = implode( '\\', array_slice( $class_parts, 0, $i ) );
+					if ( isset( self::$registrations[ $potential_namespace ] ) ) {
+						$namespace = $potential_namespace;
+						break 2;
+					}
+				}
 			}
 
 			// Try to extract namespace from file
 			if ( isset( $trace['file'] ) ) {
-				$namespace = self::extract_namespace_from_file( $trace['file'] );
-				if ( $namespace ) {
-					return $namespace;
+				$file_namespace = self::extract_namespace_from_file( $trace['file'] );
+				if ( $file_namespace && isset( self::$registrations[ $file_namespace ] ) ) {
+					$namespace = $file_namespace;
+					break;
+				}
+			}
+		}
+
+		// Cache the result
+		self::$namespace_cache[ $cache_key ] = $namespace;
+
+		return $namespace;
+	}
+
+	/**
+	 * Improved asset path detection
+	 *
+	 * @param string $target_namespace The namespace we're trying to find assets for
+	 *
+	 * @return string|null
+	 */
+	private static function detect_assets_path( string $target_namespace ): ?string {
+		$backtrace = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 10 );
+
+		foreach ( $backtrace as $trace ) {
+			if ( ! isset( $trace['file'] ) || ! file_exists( $trace['file'] ) ) {
+				continue;
+			}
+
+			$file_namespace = self::extract_namespace_from_file( $trace['file'] );
+
+			// Check if this file's namespace matches or is a parent of our target
+			if ( $file_namespace === $target_namespace ||
+			     strpos( $target_namespace, $file_namespace . '\\' ) === 0 ) {
+
+				$file_dir = dirname( $trace['file'] );
+
+				// Common patterns for finding assets
+				$patterns = [
+					$file_dir . '/assets',
+					$file_dir . '/../assets',
+					dirname( $file_dir ) . '/assets',  // For src/ structures
+					$file_dir . '/../../assets',       // For deeper structures
+				];
+
+				foreach ( $patterns as $pattern ) {
+					$resolved_path = realpath( $pattern );
+					if ( $resolved_path && is_dir( $resolved_path ) ) {
+						return $resolved_path;
+					}
 				}
 			}
 		}
@@ -384,71 +349,171 @@ class AssetLoader {
 	}
 
 	/**
-	 * Extract namespace from a PHP file
+	 * Handle version resolution
 	 *
-	 * @param string $file File path
+	 * @param string|null $version    Provided version
+	 * @param string      $file_path  File path for filemtime
+	 * @param array       $config     Configuration array
 	 *
-	 * @return string|null Extracted namespace or null if not found
+	 * @return string
 	 */
-	private static function extract_namespace_from_file( string $file ): ?string {
-		if ( ! file_exists( $file ) ) {
-			return null;
+	private static function resolve_version( ?string $version, string $file_path, array $config ): string {
+		if ( $version !== null ) {
+			return $version;
 		}
 
-		$content = file_get_contents( $file );
-
-		if ( preg_match( '/^\s*namespace\s+([^\s;]+)/m', $content, $matches ) ) {
-			return $matches[1];
+		if ( ! $config['config']['cache_busting'] ) {
+			return '1.0.0';
 		}
 
-		return null;
+		switch ( $config['config']['version_strategy'] ) {
+			case 'filemtime':
+				return (string) filemtime( $file_path );
+
+			case 'static':
+			default:
+				return '1.0.0';
+		}
 	}
 
 	/**
-	 * Convert a file path to a URL
+	 * Generate handle with prefix support
 	 *
-	 * @param string $path File path to convert
+	 * @param string $namespace
+	 * @param string $name
+	 * @param array  $config
 	 *
-	 * @return string|null URL or null if conversion fails
+	 * @return string
 	 */
-	private static function path_to_url( string $path ): ?string {
-		$path = wp_normalize_path( $path );
+	private static function generate_handle( string $namespace, string $name, array $config ): string {
+		$prefix = $config['config']['handle_prefix'] ?:
+			sanitize_key( str_replace( '\\', '-', strtolower( $namespace ) ) );
 
-		// Try wp-content first
-		$wp_content_dir = wp_normalize_path( WP_CONTENT_DIR );
-		if ( strpos( $path, $wp_content_dir ) === 0 ) {
-			return str_replace( $wp_content_dir, content_url(), $path );
-		}
-
-		// Fallback to ABSPATH
-		$abspath = wp_normalize_path( ABSPATH );
-		if ( strpos( $path, $abspath ) === 0 ) {
-			return str_replace( $abspath, home_url(), $path );
-		}
-
-		return null;
-	}
-
-	/**
-	 * Generate a unique handle for assets
-	 *
-	 * @param string $namespace Base namespace for the handle
-	 * @param string $name      Asset name
-	 *
-	 * @return string Generated handle
-	 */
-	private static function generate_handle( string $namespace, string $name ): string {
-		$base_handle = sanitize_key( str_replace( '\\', '-', strtolower( $namespace ) ) . '-' . $name );
-		$handle      = $base_handle;
+		$base_handle = $prefix . '-' . sanitize_key( $name );
+		$handle = $base_handle;
 
 		// Ensure uniqueness
 		$counter = 1;
 		while ( wp_script_is( $handle ) || wp_style_is( $handle ) ) {
 			$handle = $base_handle . '-' . $counter;
-			$counter ++;
+			$counter++;
 		}
 
 		return $handle;
+	}
+
+	/**
+	 * Extract namespace from file (cached)
+	 *
+	 * @param string $file
+	 *
+	 * @return string|null
+	 */
+	private static function extract_namespace_from_file( string $file ): ?string {
+		static $file_cache = [];
+
+		if ( isset( $file_cache[ $file ] ) ) {
+			return $file_cache[ $file ];
+		}
+
+		if ( ! file_exists( $file ) ) {
+			return null;
+		}
+
+		$content = file_get_contents( $file );
+		$namespace = null;
+
+		if ( preg_match( '/^\s*namespace\s+([^\s;]+)/m', $content, $matches ) ) {
+			$namespace = $matches[1];
+		}
+
+		$file_cache[ $file ] = $namespace;
+		return $namespace;
+	}
+
+	/**
+	 * Convert file path to URL (enhanced)
+	 *
+	 * @param string $path
+	 *
+	 * @return string|null
+	 */
+	private static function path_to_url( string $path ): ?string {
+		$path = wp_normalize_path( $path );
+
+		// Common WordPress paths
+		$mappings = [
+			wp_normalize_path( WP_CONTENT_DIR ) => content_url(),
+			wp_normalize_path( ABSPATH ) => home_url(),
+			wp_normalize_path( WP_PLUGIN_DIR ) => plugins_url(),
+		];
+
+		foreach ( $mappings as $local_path => $url ) {
+			if ( strpos( $path, $local_path ) === 0 ) {
+				return str_replace( $local_path, $url, $path );
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Enhanced localization with duplicate prevention
+	 *
+	 * @param string $handle
+	 * @param string $object_name
+	 * @param array  $data
+	 *
+	 * @return bool
+	 */
+	public static function localize_script( string $handle, string $object_name, array $data ): bool {
+		// More robust duplicate check
+		if ( wp_script_is( $handle, 'localized' ) ) {
+			global $wp_scripts;
+			if ( isset( $wp_scripts->registered[ $handle ]->extra['data'] ) &&
+			     strpos( $wp_scripts->registered[ $handle ]->extra['data'], "var $object_name" ) !== false ) {
+				return true;
+			}
+		}
+
+		return wp_localize_script( $handle, $object_name, $data );
+	}
+
+	/**
+	 * Get debug information
+	 *
+	 * @return array
+	 */
+	public static function get_debug_info(): array {
+		return [
+			'registrations' => self::$registrations,
+			'enqueued_assets' => self::$enqueued_assets,
+			'namespace_cache' => self::$namespace_cache,
+		];
+	}
+
+	/**
+	 * Clear all caches and registrations
+	 *
+	 * @param string $namespace Optional specific namespace to clear
+	 *
+	 * @return void
+	 */
+	public static function clear( string $namespace = '' ): void {
+		if ( empty( $namespace ) ) {
+			self::$registrations = [];
+			self::$enqueued_assets = [];
+			self::$namespace_cache = [];
+		} else {
+			unset( self::$registrations[ $namespace ] );
+
+			// Clear related assets
+			foreach ( self::$enqueued_assets as $key => $handle ) {
+				if ( strpos( $key, $namespace . '|' ) === 0 ) {
+					unset( self::$enqueued_assets[ $key ] );
+				}
+			}
+		}
 	}
 
 }
